@@ -573,7 +573,7 @@ def main():
     st.header("🎤 Step 1 — Upload Your Song")
     uploaded_file = st.file_uploader(
         "Upload an audio file",
-        type=["mp3", "wav", "flac", "ogg", "m4a"],
+        type=["mp3", "wav", "flac", "ogg", "m4a", "mpeg", "mp4"],
         help="Your file is processed locally — nothing is uploaded to any server."
     )
 
@@ -582,7 +582,7 @@ def main():
         st.stop()
 
     file_bytes = uploaded_file.read()
-    st.audio(file_bytes, format=uploaded_file.type)
+    st.audio(file_bytes, format="audio/mpeg")
     st.success(f"✅ Loaded: **{uploaded_file.name}** "
                f"({len(file_bytes) / 1_000_000:.1f} MB)")
 
