@@ -180,7 +180,8 @@ def extract_features(y: np.ndarray, sr: int) -> dict:
 
     # ── 2. RHYTHM / TEMPO ────────────────────────────────────────────────────
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
-    features['tempo'] = float(tempo)
+    tempo = float(np.asarray(tempo).flatten()[0])
+    features['tempo'] = float(np.asarray(tempo).flatten()[0])
 
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     if len(beats) > 0:
