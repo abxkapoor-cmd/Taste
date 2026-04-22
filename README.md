@@ -1,1 +1,1 @@
-URL: https://moodmatch-veadhadjsuavofdmip8vwz.streamlit.app/
+URL: https://taste-veadhadjsuavofdmip8vwz.streamlit.app/
