@@ -23,6 +23,7 @@ import uuid
 import io
 import requests
 import tempfile
+from typing import Optional  # FIX #4: replaced `bytes | None` with Optional[bytes]
 
 import librosa
 import librosa.effects
@@ -118,6 +119,8 @@ def get_feedback_count():
 # SPOTIFY CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
 
+# FIX #5: Cache the Spotify client so it isn't re-created on every rerun
+@st.cache_resource
 def get_spotify_client():
     auth_manager = SpotifyClientCredentials(
         client_id=SPOTIFY_CLIENT_ID,
@@ -134,21 +137,21 @@ def search_spotify_songs(sp, query: str, limit: int = 10) -> list:
         results = sp.search(q=query, type='track', limit=limit)
         tracks = results.get('tracks', {}).get('items', [])
         return [{
-            'id':          t['id'],
-            'name':        t['name'],
-            'artist':      ', '.join(a['name'] for a in t['artists']),
-            'preview_url': t.get('preview_url'),
+            'id':           t['id'],
+            'name':         t['name'],
+            'artist':       ', '.join(a['name'] for a in t['artists']),
+            'preview_url':  t.get('preview_url'),
             'external_url': t['external_urls'].get('spotify', ''),
-            'album_art':   t['album']['images'][0]['url'] if t['album']['images'] else None,
-            'duration_ms': t['duration_ms'],
-            'popularity':  t.get('popularity', 0),
+            'album_art':    t['album']['images'][0]['url'] if t['album']['images'] else None,
+            'duration_ms':  t['duration_ms'],
+            'popularity':   t.get('popularity', 0),
         } for t in tracks]
     except Exception as e:
         st.error(f"Spotify search error: {e}")
         return []
 
 
-def download_preview(preview_url: str) -> bytes | None:
+def download_preview(preview_url: str) -> Optional[bytes]:  # FIX #4
     """Download a Spotify 30s preview MP3 and return as bytes."""
     try:
         response = requests.get(preview_url, timeout=10)
@@ -158,7 +161,8 @@ def download_preview(preview_url: str) -> bytes | None:
     except Exception:
         return None
 
-def get_soundcloud_audio(query: str) -> bytes | None:
+
+def get_soundcloud_audio(query: str) -> Optional[bytes]:  # FIX #4
     """Search SoundCloud and download the audio for a given song query."""
     try:
         import yt_dlp
@@ -175,18 +179,18 @@ def get_soundcloud_audio(query: str) -> bytes | None:
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([search_query])
-        
+
         with open('/tmp/taste_audio.mp3', 'rb') as f:
             return f.read()
     except Exception as e:
         st.error(f"SoundCloud download failed: {e}")
         return None
-    
+
 
 def search_tracks_by_features(sp, features: dict, n_results: int = 50) -> list:
     """Search Spotify for recommendations based on audio features."""
-    tempo    = features.get('tempo', 120.0)
-    rms_mean = features.get('rms_mean', 0.05)
+    tempo      = features.get('tempo', 120.0)
+    rms_mean   = features.get('rms_mean', 0.05)
     harm_ratio = features.get('harmonic_ratio', 0.5)
 
     if tempo > 120:
@@ -209,7 +213,7 @@ def search_tracks_by_features(sp, features: dict, n_results: int = 50) -> list:
         "top hits"
     ]
 
-    results = []
+    results  = []
     seen_ids = set()
 
     for query in queries:
@@ -237,6 +241,8 @@ def search_tracks_by_features(sp, features: dict, n_results: int = 50) -> list:
                         '_target_instrumental': float(np.clip(1.0 - features.get('zcr_mean', 0.05) * 10, 0, 1)),
                     })
         except Exception as e:
+            # FIX #11: surface errors instead of silently swallowing them
+            st.warning(f"Search query '{query}' failed: {e}")
             continue
 
     return results[:n_results]
@@ -335,8 +341,9 @@ def extract_features(y: np.ndarray, sr: int) -> dict:
     return features
 
 
+# FIX #7: Sort keys so vector ordering is always deterministic
 def features_to_vector(features: dict) -> np.ndarray:
-    return np.array(list(features.values()), dtype=np.float32)
+    return np.array([features[k] for k in sorted(features.keys())], dtype=np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -375,11 +382,15 @@ def predict_score(pipeline, feature_vec):
     return float(np.clip(pipeline.predict(fv)[0], 1.0, 10.0))
 
 
-def get_feature_weights(pipeline, n_features):
+def get_feature_weights(pipeline, n_features: int) -> np.ndarray:
     if pipeline is None:
         return np.ones(n_features, dtype=np.float32)
     importances = pipeline.named_steps['model'].feature_importances_
-    return (importances / (importances.mean() + 1e-10)).astype(np.float32)
+    # FIX #8: safely handle length mismatch between importances and n_features
+    weights = np.ones(n_features, dtype=np.float32)
+    min_len = min(len(importances), n_features)
+    weights[:min_len] = (importances[:min_len] / (importances[:min_len].mean() + 1e-10))
+    return weights
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -393,14 +404,16 @@ def weighted_cosine_similarity(vec_a, vec_b, weights):
     return float(1.0 - cosine(wa, wb))
 
 
-def spotify_track_to_vector(track, ref_features):
-    n = len(ref_features)
-    vec = np.zeros(n, dtype=np.float32)
-    feature_names = list(ref_features.keys())
+# FIX #7: Use sorted keys to match features_to_vector ordering
+def spotify_track_to_vector(track: dict, ref_features: dict) -> np.ndarray:
+    sorted_keys  = sorted(ref_features.keys())
+    n            = len(sorted_keys)
+    vec          = np.zeros(n, dtype=np.float32)
+    key_to_index = {k: i for i, k in enumerate(sorted_keys)}
 
     def set_feat(name, value):
-        if name in feature_names:
-            vec[feature_names.index(name)] = float(value)
+        if name in key_to_index:
+            vec[key_to_index[name]] = float(value)
 
     set_feat('tempo',                  track.get('_target_tempo', 120.0))
     set_feat('rms_mean',               track.get('_target_energy', 0.5) * 0.1)
@@ -446,82 +459,33 @@ def main():
     st.markdown("""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
-
-        html, body, [class*="css"] {
-            font-family: 'Inter', sans-serif;
-        }.main {
-            background-color: #0a0a0a;
-        }.stApp {
-            background: linear-gradient(135deg, #0a0a0a 0%, #111827 100%);
-        }.taste-header {
-            text-align: center;
-            padding: 2rem 0 1rem 0;
-        }.taste-title {
-            font-size: 4rem;
-            font-weight: 700;
+        html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+        .main { background-color: #0a0a0a; }
+        .stApp { background: linear-gradient(135deg, #0a0a0a 0%, #111827 100%); }
+        .taste-header { text-align: center; padding: 2rem 0 1rem 0; }
+        .taste-title {
+            font-size: 4rem; font-weight: 700;
             background: linear-gradient(90deg, #1db954, #1ed760, #17a844);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            letter-spacing: -2px;
-        }.taste-subtitle {
-            font-size: 1.1rem;
-            color: #9ca3af;
-            margin-top: -0.5rem;
-        }.step-header {
-            font-size: 1.4rem;
-            font-weight: 600;
-            color: #ffffff;
-            margin: 1.5rem 0 0.5rem 0;
-        }.track-card {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            border: 1px solid #2d2d2d;
-            border-radius: 16px;
-            padding: 1.2rem;
-            margin-bottom: 1rem;
-            transition: all 0.2s ease;
-        }.search-result {
-            background: #1a1a2e;
-            border: 1px solid #2d2d2d;
-            border-radius: 12px;
-            padding: 0.8rem 1rem;
-            margin-bottom: 0.5rem;
-            cursor: pointer;
-        }.search-result:hover {
-            border-color: #1db954;
-        }.stButton > button {
-            background: linear-gradient(90deg, #1db954, #17a844);
-            color: white;
-            border: none;
-            border-radius: 50px;
-            font-weight: 600;
-            padding: 0.5rem 2rem;
-            transition: all 0.2s ease;
-        }.stButton > button:hover {
-            transform: scale(1.02);
-            box-shadow: 0 4px 20px rgba(29, 185, 84, 0.4);
-        }.stSlider > div > div {
-            background: #1db954 !important;
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text; letter-spacing: -2px;
         }
+        .taste-subtitle { font-size: 1.1rem; color: #9ca3af; margin-top: -0.5rem; }
+        .step-header { font-size: 1.4rem; font-weight: 600; color: #ffffff; margin: 1.5rem 0 0.5rem 0; }
+        .stButton > button {
+            background: linear-gradient(90deg, #1db954, #17a844);
+            color: white; border: none; border-radius: 50px;
+            font-weight: 600; padding: 0.5rem 2rem; transition: all 0.2s ease;
+        }
+        .stButton > button:hover { transform: scale(1.02); box-shadow: 0 4px 20px rgba(29,185,84,0.4); }
         div[data-testid="metric-container"] {
-            background: #1a1a2e;
-            border: 1px solid #2d2d2d;
-            border-radius: 12px;
-            padding: 0.8rem;
-        }.selected-song-card {
-            background: linear-gradient(135deg, #1db95420, #1db95410);
-            border: 1px solid #1db954;
-            border-radius: 16px;
-            padding: 1rem 1.5rem;
-            margin: 1rem 0;
+            background: #1a1a2e; border: 1px solid #2d2d2d; border-radius: 12px; padding: 0.8rem;
         }
         </style>
     """, unsafe_allow_html=True)
 
-    # Init
+    # ── Init ──────────────────────────────────────────────────────────────────
     init_db()
 
-    # Session state
     defaults = {
         'session_id':      generate_session_id(),
         'recommendations': [],
@@ -540,7 +504,7 @@ def main():
 
     sp = get_spotify_client()
 
-    # ── Sidebar ──────────────────────────────────────────────────────────────
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("## 🎵 Taste")
         st.caption("Songs that feel the same way.")
@@ -582,7 +546,6 @@ def main():
             <div class="taste-subtitle">find songs that make you feel exactly the same way</div>
         </div>
     """, unsafe_allow_html=True)
-
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -604,12 +567,14 @@ def main():
     if search_clicked and query:
         with st.spinner("Searching Spotify..."):
             st.session_state.search_results = search_spotify_songs(sp, query, limit=8)
-            st.session_state.search_query = query
+            st.session_state.search_query   = query
 
     # ── Search Results ────────────────────────────────────────────────────────
     if st.session_state.search_results:
         st.markdown("**Select a song:**")
-        for track in st.session_state.search_results:
+
+        # FIX #2: use enumerate so `i` is always defined
+        for i, track in enumerate(st.session_state.search_results):
             col_art, col_info, col_select = st.columns([1, 6, 2])
 
             with col_art:
@@ -618,53 +583,49 @@ def main():
 
             with col_info:
                 st.markdown(f"**{track['name']}**")
-                st.caption(f"{track['artist']}")
+                st.caption(track['artist'])
 
             with col_select:
+                # FIX #1: single button block — try Spotify preview first, fall back to SoundCloud
                 if st.button("Select ✓", key=f"select_{track['id']}_{i}",
                              use_container_width=True):
-                    st.session_state.selected_track = track
-                    # Download preview
+                    st.session_state.selected_track  = track
+                    st.session_state.recommendations = []
+
                     if track.get('preview_url'):
                         with st.spinner("Loading preview..."):
                             preview = download_preview(track['preview_url'])
                             st.session_state.preview_bytes = preview
                     else:
-                        st.session_state.preview_bytes = None
-                    st.session_state.recommendations = []
-                    st.rerun()
-            with col_select:
-                if st.button("Select ✓", key=f"select_{track['id']}",
-                                use_container_width=True):
-                    st.session_state.selected_track = track
-                    with st.spinner("Finding audio on SoundCloud..."):
-                        query = f"{track['name']} {track['artist']}"
-                        audio = get_soundcloud_audio(query)
-                        if audio:
-                            st.session_state.preview_bytes = audio
-                            st.success("✅ Audio loaded!")
-                        else:
-                            st.session_state.preview_bytes = None
-                    st.session_state.recommendations = []
+                        # FIX #3: renamed inner variable to sc_query to avoid shadowing outer `query`
+                        sc_query = f"{track['name']} {track['artist']}"
+                        with st.spinner("Finding audio on SoundCloud..."):
+                            audio = get_soundcloud_audio(sc_query)
+                            if audio:
+                                st.session_state.preview_bytes = audio
+                                st.success("✅ Audio loaded from SoundCloud!")
+                            else:
+                                st.session_state.preview_bytes = None
                     st.rerun()
 
-    # ── Also allow file upload as fallback ───────────────────────────────────
+    # ── File upload fallback ──────────────────────────────────────────────────
     with st.expander("📁 Or upload your own file instead"):
         uploaded_file = st.file_uploader(
             "Upload an audio file",
             type=["mp3", "wav", "flac", "ogg", "m4a", "mpeg", "mp4"],
         )
         if uploaded_file:
+            # FIX #10: set preview_bytes before selected_track to avoid flash
             file_bytes = uploaded_file.read()
-            st.session_state.preview_bytes = file_bytes
+            st.session_state.preview_bytes  = file_bytes
             st.session_state.selected_track = {
-                'id':          'uploaded',
-                'name':        uploaded_file.name,
-                'artist':      'Uploaded file',
-                'preview_url': None,
+                'id':           'uploaded',
+                'name':         uploaded_file.name,
+                'artist':       'Uploaded file',
+                'preview_url':  None,
                 'external_url': '',
-                'album_art':   None,
-                'duration_ms': 0,
+                'album_art':    None,
+                'duration_ms':  0,
             }
             st.success(f"✅ Loaded: {uploaded_file.name}")
             st.rerun()
@@ -676,7 +637,6 @@ def main():
         track = st.session_state.selected_track
         st.divider()
 
-        # Selected song card
         col_art, col_info = st.columns([1, 6])
         with col_art:
             if track.get('album_art'):
@@ -687,52 +647,49 @@ def main():
             if track.get('external_url'):
                 st.markdown(f"[Open on Spotify ↗]({track['external_url']})")
 
-        # Play preview
         if st.session_state.preview_bytes:
             st.audio(st.session_state.preview_bytes, format="audio/mpeg")
             st.caption("⬆️ Listen to the preview above to find your favourite part")
         else:
-            st.warning("⚠️ No preview available for this song — "
-                       "try searching for another version or upload the file directly")
+            st.warning("⚠️ No preview available — try another version or upload the file directly")
 
         st.divider()
 
-        # ── Pick the part ─────────────────────────────────────────────────────
         st.markdown('<div class="step-header">✂️ Step 2 — Pick the Part That Hits</div>',
                     unsafe_allow_html=True)
         st.markdown("Set the **start and end time** of the 10–20 second moment you want to match.")
 
-        # Work out max duration
-        if track.get('duration_ms', 0) > 0:
-            max_duration = track['duration_ms'] / 1000
-        else:
-            max_duration = 300.0  # default 5 mins for uploaded files
-
-        # For Spotify previews, cap at 30 seconds
+        # FIX #6: correct max_duration logic
         if track.get('preview_url') and track['id'] != 'uploaded':
             max_duration = 30.0
             st.info("💡 Spotify previews are 30 seconds — pick your segment within that window")
+        elif track.get('duration_ms', 0) > 0:
+            max_duration = track['duration_ms'] / 1000
+        else:
+            max_duration = 300.0
 
         col1, col2 = st.columns(2)
         with col1:
             start_sec = st.number_input(
                 "⏱ Start time (seconds)",
                 min_value=0.0,
-                max_value=float(max_duration - 10),
+                max_value=float(max(max_duration - 10, 0.0)),
                 value=0.0,
                 step=0.5
             )
         with col2:
             end_sec = st.number_input(
                 "⏱ End time (seconds)",
-                min_value=start_sec + 10.0,
-                max_value=min(start_sec + 20.0, float(max_duration)),
-                value=min(start_sec + 15.0, float(max_duration)),
+                min_value=float(start_sec + 10.0),
+                max_value=float(min(start_sec + 20.0, max_duration)),
+                # FIX #6: safe default that never exceeds max_duration
+                value=float(min(start_sec + 15.0, max_duration)),
                 step=0.5
             )
 
         duration = end_sec - start_sec
 
+        # FIX #9: validate BEFORE entering spinner so st.stop() is safe
         if duration < 10.0:
             st.warning(f"⚠️ Too short ({duration:.1f}s) — minimum is 10 seconds")
             st.stop()
@@ -753,14 +710,19 @@ def main():
         if st.button("🚀 Analyse & Find Matches", type="primary",
                      use_container_width=True):
 
+            # FIX #9: guard checks BEFORE spinners so st.stop() never fires inside one
             if not st.session_state.preview_bytes:
                 st.error("❌ No audio to analyse — please select a song with a preview "
                          "or upload a file")
                 st.stop()
 
+            features  = None
+            feat_vec  = None
+            candidates = []
+
             with st.spinner("🎼 Analysing your audio fingerprint..."):
                 try:
-                    y, sr = load_audio_segment(
+                    y, sr    = load_audio_segment(
                         st.session_state.preview_bytes, start_sec, end_sec
                     )
                     features = extract_features(y, sr)
@@ -769,21 +731,24 @@ def main():
                     st.session_state.ref_vec      = feat_vec
                 except Exception as e:
                     st.error(f"❌ Audio analysis failed: {e}")
-                    st.stop()
+
+            # FIX #9: stop after spinner exits, not inside it
+            if features is None:
+                st.stop()
 
             # Feature summary
             with st.expander("🔬 Your Audio Fingerprint", expanded=False):
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("🥁 Tempo",           f"{features['tempo']:.1f} BPM")
-                c2.metric("⚡ Energy",           f"{features['rms_mean']:.4f}")
-                c3.metric("🎸 Harmonic",         f"{features['harmonic_ratio']:.1%}")
-                c4.metric("🥁 Percussive",       f"{features['percussive_ratio']:.1%}")
+                c1.metric("🥁 Tempo",       f"{features['tempo']:.1f} BPM")
+                c2.metric("⚡ Energy",       f"{features['rms_mean']:.4f}")
+                c3.metric("🎸 Harmonic",     f"{features['harmonic_ratio']:.1%}")
+                c4.metric("🥁 Percussive",   f"{features['percussive_ratio']:.1%}")
 
                 c5, c6, c7, c8 = st.columns(4)
-                c5.metric("💓 Beat Strength",    f"{features['beat_strength_mean']:.3f}")
-                c6.metric("🌈 Spectral Centre",  f"{features['spectral_centroid_mean']:.0f} Hz")
-                c7.metric("🎯 Beat Regularity",  f"{features['beat_regularity']:.1f}")
-                c8.metric("〰️ Texture",          f"{features['zcr_mean']:.4f}")
+                c5.metric("💓 Beat Strength",   f"{features['beat_strength_mean']:.3f}")
+                c6.metric("🌈 Spectral Centre", f"{features['spectral_centroid_mean']:.0f} Hz")
+                c7.metric("🎯 Beat Regularity", f"{features['beat_regularity']:.1f}")
+                c8.metric("〰️ Texture",         f"{features['zcr_mean']:.4f}")
 
                 st.markdown("**MFCC Timbre Fingerprint:**")
                 st.bar_chart({f"MFCC {i}": features[f'mfcc_{i}_mean'] for i in range(13)})
@@ -797,7 +762,6 @@ def main():
                     candidates = search_tracks_by_features(sp, features, n_results=50)
                 except Exception as e:
                     st.error(f"❌ Search error: {e}")
-                    st.stop()
 
             if not candidates:
                 st.warning("No matches found — check your Spotify credentials")
@@ -809,7 +773,7 @@ def main():
 
             st.session_state.recommendations = ranked[:10]
             st.session_state.feedback_given  = {}
-            st.success(f"✅ Found your top **10** emotional matches!")
+            st.success("✅ Found your top **10** emotional matches!")
 
         # ══════════════════════════════════════════════════════════════════════
         # STEP 4 — RESULTS
@@ -854,7 +818,7 @@ def main():
 
                     with col_rate:
                         if already_rated:
-                            r = st.session_state.feedback_given[track['id']]
+                            r   = st.session_state.feedback_given[track['id']]
                             bar = "█" * r + "░" * (10 - r)
                             st.success(f"Rated: {r}/10\n`{bar}`")
                         else:
@@ -876,7 +840,8 @@ def main():
                                 st.session_state.feedback_given[track['id']] = rating
 
                                 total = get_feedback_count()
-                                if total >= MIN_SAMPLES_TO_TRAIN and total % 5 == 0:
+                                # FIX #12: guard against total==0 and only retrain every 5 NEW ratings
+                                if total >= MIN_SAMPLES_TO_TRAIN and total > 0 and total % 5 == 0:
                                     new_pipeline = train_model(load_all_feedback())
                                     if new_pipeline:
                                         st.session_state.ml_pipeline = new_pipeline
