@@ -158,6 +158,30 @@ def download_preview(preview_url: str) -> bytes | None:
     except Exception:
         return None
 
+def get_soundcloud_audio(query: str) -> bytes | None:
+    """Search SoundCloud and download the audio for a given song query."""
+    try:
+        import yt_dlp
+        search_query = f"scsearch1:{query}"
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+            }],
+            'outtmpl': '/tmp/taste_audio.%(ext)s',
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([search_query])
+        
+        with open('/tmp/taste_audio.mp3', 'rb') as f:
+            return f.read()
+    except Exception as e:
+        st.error(f"SoundCloud download failed: {e}")
+        return None
+    
 
 def search_tracks_by_features(sp, features: dict, n_results: int = 50) -> list:
     """Search Spotify for recommendations based on audio features."""
@@ -607,6 +631,20 @@ def main():
                             st.session_state.preview_bytes = preview
                     else:
                         st.session_state.preview_bytes = None
+                    st.session_state.recommendations = []
+                    st.rerun()
+            with col_select:
+                if st.button("Select ✓", key=f"select_{track['id']}",
+                                use_container_width=True):
+                    st.session_state.selected_track = track
+                    with st.spinner("Finding audio on SoundCloud..."):
+                        query = f"{track['name']} {track['artist']}"
+                        audio = get_soundcloud_audio(query)
+                        if audio:
+                            st.session_state.preview_bytes = audio
+                            st.success("✅ Audio loaded!")
+                        else:
+                            st.session_state.preview_bytes = None
                     st.session_state.recommendations = []
                     st.rerun()
 
